@@ -99,7 +99,8 @@ func WithQueueRangeGetLimit(queueRangeGetLimit int64) TakeOption {
 }
 
 // Take takes a non-running job from the queue and lock it.
-// If there is no available job, it waits for one.
+// If there is no available job, it waits for one, or it returns
+// if ctx is canceled or deadline exceeded.
 func (q *Queue) Take(ctx context.Context, workerID string,
 	opts ...TakeOption) (job *Job, err error) {
 
@@ -252,6 +253,46 @@ func buildLockOptions(opts ...LockOption) *lockOptions {
 		opt(options)
 	}
 	return options
+}
+
+// Lock locks the key if not already locked by another locker.
+// If the key is already locked by another locker, it waits for the lock
+// to be released and then locks the key, or it returns if ctx is canceled
+// or deadline exceeded.
+//
+// The lock are automatically released after the TTL specified with
+// WithLockTTL or the default TTL (10 seconds).
+//
+// To keep the lock longer than that, you need to call Lock.Renew periodically.
+func (l *Locker) Lock(ctx context.Context, key, value string,
+	opts ...LockOption) (*Lock, error) {
+
+	for {
+		lock, err := l.TryLock(ctx, key, value, opts...)
+		if err != nil {
+			return nil, err
+		}
+		if lock != nil {
+			return lock, nil
+		}
+
+		if err := l.waitKeyChange(ctx, key); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func (l *Locker) waitKeyChange(ctx context.Context, key string) error {
+	ctx2, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	watchCh := l.client.Watch(ctx2, key)
+	select {
+	case <-watchCh:
+	case <-ctx2.Done():
+		return ctx2.Err()
+	}
+	return nil
 }
 
 // TryLock locks the key if not already locked by another locker.

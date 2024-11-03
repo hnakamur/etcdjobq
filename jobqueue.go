@@ -1,22 +1,28 @@
+// Package etcdjobq provides a simple job queue using etcd.
 package etcdjobq
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/google/uuid"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
+// ErrJobAlreadyDeleted is the error returned by Job.Finish when the task
+// is already deleted. It is likey a programming error.
 var ErrJobAlreadyDeleted = errors.New("job already deleted")
 
+// Queue is the job queue.
 type Queue struct {
 	client       *clientv3.Client
 	queuePrefix  string
 	workerPrefix string
 }
 
+// Job represents a running job.
 type Job struct {
 	ID    string
 	Value string
@@ -25,7 +31,8 @@ type Job struct {
 	queue *Queue
 }
 
-func New(client *clientv3.Client, queuePrefix, workerPrefix string) *Queue {
+// NewQueue creates a Queue.
+func NewQueue(client *clientv3.Client, queuePrefix, workerPrefix string) *Queue {
 	return &Queue{
 		client:       client,
 		queuePrefix:  queuePrefix,
@@ -33,6 +40,8 @@ func New(client *clientv3.Client, queuePrefix, workerPrefix string) *Queue {
 	}
 }
 
+// Enqueue create a new job with the specified value.
+// The issued job ID is returned.
 func (q *Queue) Enqueue(ctx context.Context, value string) (jobID string, err error) {
 	for {
 		jobID, err = q.issueJobID()
@@ -71,20 +80,26 @@ type takeOptions struct {
 	queueRangeGetLimit int64
 }
 
+// TakeOption is a function on the options for Queue.Take method.
 type TakeOption func(*takeOptions)
 
-func WithWorkerLockTTL(workerTTL int64) TakeOption {
+// WithWorkerLockTTL is a TakeOption to set worker lock TTL in seconds.
+func WithWorkerLockTTL(workerLockTTL int64) TakeOption {
 	return func(opts *takeOptions) {
-		opts.workerLockTTL = workerTTL
+		opts.workerLockTTL = workerLockTTL
 	}
 }
 
+// WithQueueRangeGetLimit is a TakeOption to set the limit for range get
+// of jobs in the queue.
 func WithQueueRangeGetLimit(queueRangeGetLimit int64) TakeOption {
 	return func(opts *takeOptions) {
 		opts.queueRangeGetLimit = queueRangeGetLimit
 	}
 }
 
+// Take takes a non-running job from the queue and lock it.
+// If there is no available job, it waits for one.
 func (q *Queue) Take(ctx context.Context, workerID string,
 	opts ...TakeOption) (job *Job, err error) {
 
@@ -97,11 +112,13 @@ func (q *Queue) Take(ctx context.Context, workerID string,
 			return job, nil
 		}
 
-		q.waitQueueOrWorkerChange(ctx)
+		if err := q.waitQueueOrWorkerChange(ctx); err != nil {
+			return nil, err
+		}
 	}
 }
 
-func (q *Queue) waitQueueOrWorkerChange(ctx context.Context) {
+func (q *Queue) waitQueueOrWorkerChange(ctx context.Context) error {
 	ctx2, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -110,8 +127,10 @@ func (q *Queue) waitQueueOrWorkerChange(ctx context.Context) {
 	select {
 	case <-queueWatchCh:
 	case <-workerWatchCh:
-	case <-ctx.Done():
+	case <-ctx2.Done():
+		return ctx2.Err()
 	}
+	return nil
 }
 
 func buildTakeOptions(opts ...TakeOption) *takeOptions {
@@ -143,7 +162,7 @@ func (q *Queue) takeNoWait(ctx context.Context, workerID string,
 			clientv3.WithRange(clientv3.GetPrefixRangeEnd(q.queuePrefix)),
 			clientv3.WithLimit(options.queueRangeGetLimit))
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("get key: %s, err: %w", key, err)
 		}
 		if getResp.Count == 0 {
 			return nil, nil
@@ -175,6 +194,7 @@ func (q *Queue) takeNoWait(ctx context.Context, workerID string,
 	}
 }
 
+// Finish deletes the job from the queue and release the lock for it.
 func (j *Job) Finish(ctx context.Context) error {
 	q := j.queue
 	jobKey := q.queuePrefix + j.ID
@@ -198,25 +218,28 @@ type lockOptions struct {
 	lockTTL int64
 }
 
+// LockOption is a function on the options for Locker.Lock method.
 type LockOption func(*lockOptions)
 
+// WithLockTTL is a LockOption to set TTL for a lock.
 func WithLockTTL(lockTTL int64) LockOption {
 	return func(opts *lockOptions) {
 		opts.lockTTL = lockTTL
 	}
 }
 
+// Locker locks a key with the specified TTL.
 type Locker struct {
 	client *clientv3.Client
 }
 
+// NewLocker creates a Locker.
 func NewLocker(client *clientv3.Client) *Locker {
 	return &Locker{client: client}
 }
 
+// Lock is a lock for a key.
 type Lock struct {
-	KeepAliveCh <-chan *clientv3.LeaseKeepAliveResponse
-
 	locker  *Locker
 	leaseID clientv3.LeaseID
 }
@@ -231,6 +254,13 @@ func buildLockOptions(opts ...LockOption) *lockOptions {
 	return options
 }
 
+// TryLock locks the key if not already locked by another locker.
+// If the key is already locked by another locker, it returns nil.
+//
+// The lock are automatically released after the TTL specified with
+// WithLockTTL or the default TTL (10 seconds).
+//
+// To keep the lock longer than that, you need to call Lock.Renew periodically.
 func (l *Locker) TryLock(ctx context.Context, key, value string,
 	opts ...LockOption) (*Lock, error) {
 
@@ -246,22 +276,26 @@ func (l *Locker) TryLock(ctx context.Context, key, value string,
 		Then(clientv3.OpPut(key, value, clientv3.WithLease(leaseID))).
 		Commit()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to TryLock: key: %s, err: %w", key, err)
 	}
 	if txnResp.Succeeded {
-		kaCh, err := l.client.KeepAlive(ctx, leaseID)
-		if err != nil {
-			return nil, err
-		}
 		return &Lock{
-			KeepAliveCh: kaCh,
-			locker:      l,
-			leaseID:     leaseID,
+			locker:  l,
+			leaseID: leaseID,
 		}, nil
 	}
 	return nil, nil
 }
 
+// Renew extends the lock TTL.
+func (l *Lock) Renew(ctx context.Context) error {
+	if _, err := l.locker.client.KeepAliveOnce(ctx, l.leaseID); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Unlock releases the lock.
 func (l *Lock) Unlock(ctx context.Context) error {
 	if _, err := l.locker.client.Revoke(ctx, l.leaseID); err != nil {
 		return err

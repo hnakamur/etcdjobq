@@ -1,4 +1,4 @@
-module github.com/hnakmur/etcdjobq
+module github.com/hnakamur/etcdjobq
 
 go 1.23
 

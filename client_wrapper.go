@@ -28,7 +28,7 @@ type clientWrapper interface {
 	WatchOnceTwoPrefixes(ctx context.Context, prefix1, prefix2 string) error
 
 	Grant(ctx context.Context, ttl int64) (leaseID leaseID, err error)
-	KeepAliveOnce(ctx context.Context, leaseID leaseID) error
+	KeepAlive(ctx context.Context, leaseID leaseID) error
 	Revoke(ctx context.Context, leaseID leaseID) error
 }
 
@@ -126,8 +126,8 @@ func (c *realClientWrapper) Grant(ctx context.Context, ttl int64) (leaseID lease
 	return grantResp.ID, nil
 }
 
-func (c *realClientWrapper) KeepAliveOnce(ctx context.Context, leaseID leaseID) error {
-	if _, err := c.impl.KeepAliveOnce(ctx, leaseID); err != nil {
+func (c *realClientWrapper) KeepAlive(ctx context.Context, leaseID leaseID) error {
+	if _, err := c.impl.KeepAlive(ctx, leaseID); err != nil {
 		return err
 	}
 	return nil

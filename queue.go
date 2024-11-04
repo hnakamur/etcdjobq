@@ -50,6 +50,7 @@ func (q *Queue) Enqueue(ctx context.Context, value string) (jobID string, err er
 		}
 		key := q.queuePrefix + jobID
 		succeeded, err := q.client.PutIfNotExist(ctx, key, value)
+		// log.Printf("Enqueue key=%s, value=%s, succeeded=%v, err=%v", key, value, succeeded, err)
 		if err != nil {
 			return "", err
 		}
@@ -68,22 +69,23 @@ func (q *Queue) issueJobID() (jobID string, err error) {
 }
 
 const (
-	defaultWorkerLockTTL      = 10
-	defaultQueueRangeGetLimit = 100
+	defaultWorkerLockTTL      = 1
+	defaultQueueRangeGetLimit = 10
 )
 
 type takeOptions struct {
-	workerLockTTL      int64
+	workerLockLeaseTTL int64
 	queueRangeGetLimit int64
 }
 
 // TakeOption is a function on the options for Queue.Take method.
 type TakeOption func(*takeOptions)
 
-// WithWorkerLockTTL is a TakeOption to set worker lock TTL in seconds.
-func WithWorkerLockTTL(workerLockTTL int64) TakeOption {
+// WithWorkerLockLeaseTTL is a TakeOption to set worker lock lease time-to-live
+// in seconds.
+func WithWorkerLockLeaseTTL(workerLockLeaseTTL int64) TakeOption {
 	return func(opts *takeOptions) {
-		opts.workerLockTTL = workerLockTTL
+		opts.workerLockLeaseTTL = workerLockLeaseTTL
 	}
 }
 
@@ -97,12 +99,12 @@ func WithQueueRangeGetLimit(queueRangeGetLimit int64) TakeOption {
 
 // Take takes a non-running job from the queue and lock it.
 // If there is no available job, it waits for one, or it returns
-// if ctx is canceled or deadline exceeded.
+// if ctx is canceled or timed out.
 func (q *Queue) Take(ctx context.Context, workerID string,
 	opts ...TakeOption) (job *Job, err error) {
 
 	for {
-		job, err = q.takeNoWait(ctx, workerID, opts...)
+		job, err = q.TakeNoWait(ctx, workerID, opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -118,7 +120,7 @@ func (q *Queue) Take(ctx context.Context, workerID string,
 
 func buildTakeOptions(opts ...TakeOption) *takeOptions {
 	options := &takeOptions{
-		workerLockTTL:      defaultWorkerLockTTL,
+		workerLockLeaseTTL: defaultWorkerLockTTL,
 		queueRangeGetLimit: defaultQueueRangeGetLimit,
 	}
 	for _, opt := range opts {
@@ -127,7 +129,9 @@ func buildTakeOptions(opts ...TakeOption) *takeOptions {
 	return options
 }
 
-func (q *Queue) takeNoWait(ctx context.Context, workerID string,
+// TakeNoWait takes a non-running job from the queue and lock it.
+// It returns nil if there is no available job.
+func (q *Queue) TakeNoWait(ctx context.Context, workerID string,
 	opts ...TakeOption) (job *Job, err error) {
 
 	options := buildTakeOptions(opts...)
@@ -155,10 +159,11 @@ func (q *Queue) takeNoWait(ctx context.Context, workerID string,
 			jobID := strings.TrimPrefix(string(kv.Key), q.queuePrefix)
 			key := q.workerPrefix + jobID
 			lock, err := (&Locker{client: q.client}).TryLock(ctx, key, workerID,
-				WithLockTTL(options.workerLockTTL))
+				WithLockLeaseTTL(options.workerLockLeaseTTL))
 			if err != nil {
 				return nil, err
 			}
+			// log.Printf("TakeNoWait jobID=%s, value=%s, lockKey=%s, lock=%v, err=%v", jobID, string(kv.Value), key, lock, err)
 			if lock != nil {
 				value := string(kv.Value)
 				return &Job{
@@ -189,120 +194,6 @@ func (j *Job) Finish(ctx context.Context) error {
 	}
 
 	if err := j.Lock.Unlock(ctx); err != nil {
-		return err
-	}
-	return nil
-}
-
-const defaultLockTTL = 10
-
-type lockOptions struct {
-	lockTTL int64
-}
-
-// LockOption is a function on the options for Locker.Lock method.
-type LockOption func(*lockOptions)
-
-// WithLockTTL is a LockOption to set TTL for a lock.
-func WithLockTTL(lockTTL int64) LockOption {
-	return func(opts *lockOptions) {
-		opts.lockTTL = lockTTL
-	}
-}
-
-// Locker locks a key with the specified TTL.
-type Locker struct {
-	client clientWrapper
-}
-
-// NewLocker creates a Locker.
-func NewLocker(client *clientv3.Client) *Locker {
-	return &Locker{client: newRealClientWrapper(client)}
-}
-
-// Lock is a lock for a key.
-type Lock struct {
-	locker  *Locker
-	leaseID clientv3.LeaseID
-}
-
-func buildLockOptions(opts ...LockOption) *lockOptions {
-	options := &lockOptions{
-		lockTTL: defaultLockTTL,
-	}
-	for _, opt := range opts {
-		opt(options)
-	}
-	return options
-}
-
-// Lock locks the key if not already locked by another locker.
-// If the key is already locked by another locker, it waits for the lock
-// to be released and then locks the key, or it returns if ctx is canceled
-// or deadline exceeded.
-//
-// The lock are automatically released after the TTL specified with
-// WithLockTTL or the default TTL (10 seconds).
-//
-// To keep the lock longer than that, you need to call Lock.Renew periodically.
-func (l *Locker) Lock(ctx context.Context, key, value string,
-	opts ...LockOption) (*Lock, error) {
-
-	for {
-		lock, err := l.TryLock(ctx, key, value, opts...)
-		if err != nil {
-			return nil, err
-		}
-		if lock != nil {
-			return lock, nil
-		}
-
-		if err := l.client.WatchOnceKey(ctx, key); err != nil {
-			return nil, err
-		}
-	}
-}
-
-// TryLock locks the key if not already locked by another locker.
-// If the key is already locked by another locker, it returns nil.
-//
-// The lock are automatically released after the TTL specified with
-// WithLockTTL or the default TTL (10 seconds).
-//
-// To keep the lock longer than that, you need to call Lock.Renew periodically.
-func (l *Locker) TryLock(ctx context.Context, key, value string,
-	opts ...LockOption) (*Lock, error) {
-
-	options := buildLockOptions(opts...)
-	leaseID, err := l.client.Grant(ctx, options.lockTTL)
-	if err != nil {
-		return nil, err
-	}
-
-	succeeded, err := l.client.PutWithLeaseIfNotExist(ctx, key, value, leaseID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to TryLock: key: %s, err: %w", key, err)
-	}
-	if succeeded {
-		return &Lock{
-			locker:  l,
-			leaseID: leaseID,
-		}, nil
-	}
-	return nil, nil
-}
-
-// Renew extends the lock TTL.
-func (l *Lock) Renew(ctx context.Context) error {
-	if err := l.locker.client.KeepAliveOnce(ctx, l.leaseID); err != nil {
-		return err
-	}
-	return nil
-}
-
-// Unlock releases the lock.
-func (l *Lock) Unlock(ctx context.Context) error {
-	if err := l.locker.client.Revoke(ctx, l.leaseID); err != nil {
 		return err
 	}
 	return nil

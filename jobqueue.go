@@ -17,7 +17,7 @@ var ErrJobAlreadyDeleted = errors.New("job already deleted")
 
 // Queue is the job queue.
 type Queue struct {
-	client       *clientv3.Client
+	client       clientWrapper
 	queuePrefix  string
 	workerPrefix string
 }
@@ -34,7 +34,7 @@ type Job struct {
 // NewQueue creates a Queue.
 func NewQueue(client *clientv3.Client, queuePrefix, workerPrefix string) *Queue {
 	return &Queue{
-		client:       client,
+		client:       newRealClientWrapper(client),
 		queuePrefix:  queuePrefix,
 		workerPrefix: workerPrefix,
 	}
@@ -49,14 +49,11 @@ func (q *Queue) Enqueue(ctx context.Context, value string) (jobID string, err er
 			return "", err
 		}
 		key := q.queuePrefix + jobID
-		resp, err := q.client.Txn(ctx).
-			If(clientv3.Compare(clientv3.Version(key), "=", 0)).
-			Then(clientv3.OpPut(key, value)).
-			Commit()
+		succeeded, err := q.client.PutIfNotExist(ctx, key, value)
 		if err != nil {
 			return "", err
 		}
-		if resp.Succeeded {
+		if succeeded {
 			return jobID, nil
 		}
 	}
@@ -113,25 +110,10 @@ func (q *Queue) Take(ctx context.Context, workerID string,
 			return job, nil
 		}
 
-		if err := q.waitQueueOrWorkerChange(ctx); err != nil {
+		if err := q.client.WatchOnceTwoPrefixes(ctx, q.queuePrefix, q.workerPrefix); err != nil {
 			return nil, err
 		}
 	}
-}
-
-func (q *Queue) waitQueueOrWorkerChange(ctx context.Context) error {
-	ctx2, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	queueWatchCh := q.client.Watch(ctx2, q.queuePrefix, clientv3.WithPrefix())
-	workerWatchCh := q.client.Watch(ctx2, q.workerPrefix, clientv3.WithPrefix())
-	select {
-	case <-queueWatchCh:
-	case <-workerWatchCh:
-	case <-ctx2.Done():
-		return ctx2.Err()
-	}
-	return nil
 }
 
 func buildTakeOptions(opts ...TakeOption) *takeOptions {
@@ -159,21 +141,20 @@ func (q *Queue) takeNoWait(ctx context.Context, workerID string,
 			key = lastKey
 			i++
 		}
-		getResp, err := q.client.Get(ctx, key,
-			clientv3.WithRange(clientv3.GetPrefixRangeEnd(q.queuePrefix)),
-			clientv3.WithLimit(options.queueRangeGetLimit))
+		kvs, err := q.client.GetFromStartKeyWithPrefixAndLimit(ctx, key,
+			q.queuePrefix, options.queueRangeGetLimit)
 		if err != nil {
 			return nil, fmt.Errorf("get key: %s, err: %w", key, err)
 		}
-		if getResp.Count == 0 {
+		if len(kvs.Kvs) == 0 {
 			return nil, nil
 		}
 
-		for ; i < len(getResp.Kvs); i++ {
-			kv := getResp.Kvs[i]
+		for ; i < len(kvs.Kvs); i++ {
+			kv := kvs.Kvs[i]
 			jobID := strings.TrimPrefix(string(kv.Key), q.queuePrefix)
 			key := q.workerPrefix + jobID
-			lock, err := NewLocker(q.client).TryLock(ctx, key, workerID,
+			lock, err := (&Locker{client: q.client}).TryLock(ctx, key, workerID,
 				WithLockTTL(options.workerLockTTL))
 			if err != nil {
 				return nil, err
@@ -188,10 +169,10 @@ func (q *Queue) takeNoWait(ctx context.Context, workerID string,
 				}, nil
 			}
 		}
-		if !getResp.More {
+		if !kvs.More {
 			return nil, nil
 		}
-		lastKey = string(getResp.Kvs[len(getResp.Kvs)-1].Key)
+		lastKey = string(kvs.Kvs[len(kvs.Kvs)-1].Key)
 	}
 }
 
@@ -199,11 +180,11 @@ func (q *Queue) takeNoWait(ctx context.Context, workerID string,
 func (j *Job) Finish(ctx context.Context) error {
 	q := j.queue
 	jobKey := q.queuePrefix + j.ID
-	delResp, err := q.client.Delete(ctx, jobKey)
+	deleted, err := q.client.Delete(ctx, jobKey)
 	if err != nil {
 		return err
 	}
-	if delResp.Deleted == 0 {
+	if deleted == 0 {
 		return ErrJobAlreadyDeleted
 	}
 
@@ -231,12 +212,12 @@ func WithLockTTL(lockTTL int64) LockOption {
 
 // Locker locks a key with the specified TTL.
 type Locker struct {
-	client *clientv3.Client
+	client clientWrapper
 }
 
 // NewLocker creates a Locker.
 func NewLocker(client *clientv3.Client) *Locker {
-	return &Locker{client: client}
+	return &Locker{client: newRealClientWrapper(client)}
 }
 
 // Lock is a lock for a key.
@@ -276,23 +257,10 @@ func (l *Locker) Lock(ctx context.Context, key, value string,
 			return lock, nil
 		}
 
-		if err := l.waitKeyChange(ctx, key); err != nil {
+		if err := l.client.WatchOnceKey(ctx, key); err != nil {
 			return nil, err
 		}
 	}
-}
-
-func (l *Locker) waitKeyChange(ctx context.Context, key string) error {
-	ctx2, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	watchCh := l.client.Watch(ctx2, key)
-	select {
-	case <-watchCh:
-	case <-ctx2.Done():
-		return ctx2.Err()
-	}
-	return nil
 }
 
 // TryLock locks the key if not already locked by another locker.
@@ -306,20 +274,16 @@ func (l *Locker) TryLock(ctx context.Context, key, value string,
 	opts ...LockOption) (*Lock, error) {
 
 	options := buildLockOptions(opts...)
-	grantResp, err := l.client.Grant(ctx, options.lockTTL)
+	leaseID, err := l.client.Grant(ctx, options.lockTTL)
 	if err != nil {
 		return nil, err
 	}
-	leaseID := grantResp.ID
 
-	txnResp, err := l.client.Txn(ctx).
-		If(clientv3.Compare(clientv3.Version(key), "=", 0)).
-		Then(clientv3.OpPut(key, value, clientv3.WithLease(leaseID))).
-		Commit()
+	succeeded, err := l.client.PutWithLeaseIfNotExist(ctx, key, value, leaseID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to TryLock: key: %s, err: %w", key, err)
 	}
-	if txnResp.Succeeded {
+	if succeeded {
 		return &Lock{
 			locker:  l,
 			leaseID: leaseID,
@@ -330,7 +294,7 @@ func (l *Locker) TryLock(ctx context.Context, key, value string,
 
 // Renew extends the lock TTL.
 func (l *Lock) Renew(ctx context.Context) error {
-	if _, err := l.locker.client.KeepAliveOnce(ctx, l.leaseID); err != nil {
+	if err := l.locker.client.KeepAliveOnce(ctx, l.leaseID); err != nil {
 		return err
 	}
 	return nil
@@ -338,7 +302,7 @@ func (l *Lock) Renew(ctx context.Context) error {
 
 // Unlock releases the lock.
 func (l *Lock) Unlock(ctx context.Context) error {
-	if _, err := l.locker.client.Revoke(ctx, l.leaseID); err != nil {
+	if err := l.locker.client.Revoke(ctx, l.leaseID); err != nil {
 		return err
 	}
 	return nil

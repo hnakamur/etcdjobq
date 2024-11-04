@@ -26,9 +26,9 @@ type Queue struct {
 type Job struct {
 	ID    string
 	Value string
-	Lock  *Lock
 
 	queue *Queue
+	lock  *Lock
 }
 
 // NewQueue creates a Queue.
@@ -169,7 +169,7 @@ func (q *Queue) TakeNoWait(ctx context.Context, workerID string,
 				return &Job{
 					ID:    jobID,
 					Value: value,
-					Lock:  lock,
+					lock:  lock,
 					queue: q,
 				}, nil
 			}
@@ -193,7 +193,7 @@ func (j *Job) Finish(ctx context.Context) error {
 		return ErrJobAlreadyDeleted
 	}
 
-	if err := j.Lock.Unlock(ctx); err != nil {
+	if err := j.lock.Unlock(ctx); err != nil {
 		return err
 	}
 	return nil

@@ -2,6 +2,7 @@ package etcdjobq
 
 import (
 	"context"
+	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -26,6 +27,7 @@ type clientWrapper interface {
 
 	WatchOnceKey(ctx context.Context, key string) error
 	WatchOnceTwoPrefixes(ctx context.Context, prefix1, prefix2 string) error
+	WatchOnceTwoPrefixesAndTime(ctx context.Context, prefix1, prefix2 string, t time.Time) error
 
 	Grant(ctx context.Context, ttl int64) (leaseID leaseID, err error)
 	KeepAlive(ctx context.Context, leaseID leaseID) error
@@ -112,6 +114,24 @@ func (c *realClientWrapper) WatchOnceTwoPrefixes(ctx context.Context, prefix1, p
 	select {
 	case <-queueWatchCh:
 	case <-workerWatchCh:
+	case <-ctx2.Done():
+		return ctx2.Err()
+	}
+	return nil
+}
+
+func (c *realClientWrapper) WatchOnceTwoPrefixesAndTime(ctx context.Context, prefix1, prefix2 string, t time.Time) error {
+	ctx2, cancel := context.WithCancel(ctx)
+	defer cancel()
+	timerCtx, timerCancel := context.WithDeadline(context.Background(), t)
+	defer timerCancel()
+
+	queueWatchCh := c.impl.Watch(ctx2, prefix1, clientv3.WithPrefix())
+	workerWatchCh := c.impl.Watch(ctx2, prefix2, clientv3.WithPrefix())
+	select {
+	case <-queueWatchCh:
+	case <-workerWatchCh:
+	case <-timerCtx.Done():
 	case <-ctx2.Done():
 		return ctx2.Err()
 	}

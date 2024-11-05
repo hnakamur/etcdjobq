@@ -27,7 +27,7 @@ type clientWrapper interface {
 
 	WatchOnceKey(ctx context.Context, key string) error
 	WatchOnceTwoPrefixes(ctx context.Context, prefix1, prefix2 string) error
-	WatchOnceTwoPrefixesAndTime(ctx context.Context, prefix1, prefix2 string, t time.Time) error
+	WatchOnceTwoPrefixesAndTimeout(ctx context.Context, prefix1, prefix2 string, d time.Duration) error
 
 	Grant(ctx context.Context, ttl int64) (leaseID leaseID, err error)
 	KeepAlive(ctx context.Context, leaseID leaseID) error
@@ -120,10 +120,10 @@ func (c *realClientWrapper) WatchOnceTwoPrefixes(ctx context.Context, prefix1, p
 	return nil
 }
 
-func (c *realClientWrapper) WatchOnceTwoPrefixesAndTime(ctx context.Context, prefix1, prefix2 string, t time.Time) error {
+func (c *realClientWrapper) WatchOnceTwoPrefixesAndTimeout(ctx context.Context, prefix1, prefix2 string, d time.Duration) error {
 	ctx2, cancel := context.WithCancel(ctx)
 	defer cancel()
-	timerCtx, timerCancel := context.WithDeadline(context.Background(), t)
+	timerCtx, timerCancel := context.WithTimeout(context.Background(), d)
 	defer timerCancel()
 
 	queueWatchCh := c.impl.Watch(ctx2, prefix1, clientv3.WithPrefix())

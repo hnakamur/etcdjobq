@@ -171,7 +171,8 @@ func (q *TimedQueue) Take(ctx context.Context, workerID string,
 			return job, nil
 		}
 
-		if err := q.client.WatchOnceTwoPrefixesAndTime(ctx, q.queuePrefix, q.workerPrefix, scheduledTime); err != nil {
+		d := scheduledTime.Sub(q.now())
+		if err := q.client.WatchOnceTwoPrefixesAndTimeout(ctx, q.queuePrefix, q.workerPrefix, d); err != nil {
 			return nil, err
 		}
 	}

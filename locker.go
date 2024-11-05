@@ -57,7 +57,7 @@ func buildLockOptions(opts ...LockOption) *lockOptions {
 // or timed out.
 //
 // The lock are released when Lock.Unlock is called or after some time
-// when the underlining client is closed.
+// when the connection to the server is closed or the client died.
 func (l *Locker) Lock(ctx context.Context, key, value string,
 	opts ...LockOption) (*Lock, error) {
 
@@ -80,7 +80,7 @@ func (l *Locker) Lock(ctx context.Context, key, value string,
 // If the key is already locked by another locker, it returns nil.
 //
 // The lock are released when Lock.Unlock is called or after some time
-// when the underlining client is closed.
+// when the connection to the server is closed or the client died.
 func (l *Locker) TryLock(ctx context.Context, key, value string,
 	opts ...LockOption) (*Lock, error) {
 

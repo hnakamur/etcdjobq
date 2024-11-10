@@ -12,10 +12,10 @@ import (
 func TestQueue(t *testing.T) {
 	t.Run("singleWorker", func(t *testing.T) {
 		t.Run("oneAtTime", func(t *testing.T) {
-			etcd := startEmbeddedEtcd(t, "2379")
-			defer etcd.Close()
+			cluster := startEtcdCluster(t)
+			defer cluster.Close()
 
-			basePrefix := testNamespacePrefix() + t.Name() + "/"
+			basePrefix := t.Name() + "/"
 			queuePrefix := basePrefix + "jobQueue/"
 			workerPrefix := basePrefix + "jobWorker/"
 
@@ -28,7 +28,7 @@ func TestQueue(t *testing.T) {
 				defer wg.Done()
 
 				const workerID = "worker1"
-				cli := testNewClient(t)
+				cli := cluster.newClient(t)
 				defer cli.Close()
 
 				ctx := context.Background()
@@ -52,7 +52,7 @@ func TestQueue(t *testing.T) {
 				}
 			}()
 
-			cli := testNewClient(t)
+			cli := cluster.newClient(t)
 			defer cli.Close()
 
 			ctx := context.Background()
@@ -75,10 +75,10 @@ func TestQueue(t *testing.T) {
 				"finished job: job2")
 		})
 		t.Run("queueThenTake", func(t *testing.T) {
-			etcd := startEmbeddedEtcd(t, "2379")
-			defer etcd.Close()
+			cluster := startEtcdCluster(t)
+			defer cluster.Close()
 
-			basePrefix := testNamespacePrefix() + t.Name() + "/"
+			basePrefix := t.Name() + "/"
 			queuePrefix := basePrefix + "jobQueue/"
 			workerPrefix := basePrefix + "jobWorker/"
 
@@ -91,7 +91,7 @@ func TestQueue(t *testing.T) {
 				defer wg.Done()
 
 				const workerID = "worker1"
-				cli := testNewClient(t)
+				cli := cluster.newClient(t)
 				defer cli.Close()
 
 				ctx := context.Background()
@@ -115,7 +115,7 @@ func TestQueue(t *testing.T) {
 				}
 			}()
 
-			cli := testNewClient(t)
+			cli := cluster.newClient(t)
 			defer cli.Close()
 
 			ctx := context.Background()
@@ -138,10 +138,10 @@ func TestQueue(t *testing.T) {
 	})
 	t.Run("twoWorkers", func(t *testing.T) {
 		t.Run("queueThenLoadBalancing", func(t *testing.T) {
-			etcd := startEmbeddedEtcd(t, "2379")
-			defer etcd.Close()
+			cluster := startEtcdCluster(t)
+			defer cluster.Close()
 
-			basePrefix := testNamespacePrefix() + t.Name() + "/"
+			basePrefix := t.Name() + "/"
 			queuePrefix := basePrefix + "jobQueue/"
 			workerPrefix := basePrefix + "jobWorker/"
 
@@ -156,7 +156,7 @@ func TestQueue(t *testing.T) {
 				defer wg.Done()
 
 				const workerID = "worker1"
-				cli := testNewClient(t)
+				cli := cluster.newClient(t)
 				defer cli.Close()
 
 				ctx := context.Background()
@@ -195,7 +195,7 @@ func TestQueue(t *testing.T) {
 				defer wg.Done()
 
 				const workerID = "worker2"
-				cli := testNewClient(t)
+				cli := cluster.newClient(t)
 				defer cli.Close()
 
 				ctx := context.Background()
@@ -217,7 +217,7 @@ func TestQueue(t *testing.T) {
 				logs.Append(fmt.Sprintf("%s finished job: %s", workerID, job.Value))
 			}()
 
-			cli := testNewClient(t)
+			cli := cluster.newClient(t)
 			defer cli.Close()
 
 			ctx := context.Background()

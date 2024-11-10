@@ -3,6 +3,7 @@ package etcdjobq_test
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -11,10 +12,14 @@ import (
 
 	"github.com/hnakamur/etcdjobq"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/server/v3/embed"
 )
 
 func TestLocker(t *testing.T) {
 	t.Run("normal", func(t *testing.T) {
+		etcd := startEmbeddedEtcd(t, "2379")
+		defer etcd.Close()
+
 		activeWorkerKey := testNamespacePrefix() + t.Name() + "/active-worker"
 
 		heartbeatCh := make(chan struct{}, 1)
@@ -81,6 +86,9 @@ func TestLocker(t *testing.T) {
 			"worker2 unlocked")
 	})
 	t.Run("closeClientWithoutUnlock", func(t *testing.T) {
+		etcd := startEmbeddedEtcd(t, "2379")
+		defer etcd.Close()
+
 		activeWorkerKey := testNamespacePrefix() + t.Name() + "/active-worker"
 
 		heartbeatCh := make(chan struct{}, 1)
@@ -147,6 +155,30 @@ func testNamespacePrefix() string {
 		return prefix
 	}
 	return "etcqjobqTest/"
+}
+
+func startEmbeddedEtcd(t *testing.T, port string) *embed.Etcd {
+	cfg := embed.NewConfig()
+	cfg.Dir = t.TempDir()
+	lcurl, err := url.Parse("http://localhost:" + port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ListenClientUrls = []url.URL{*lcurl}
+
+	e, err := embed.StartEtcd(cfg)
+	if err != nil {
+		t.Fatalf("failed to start embedded etcd: %v", err)
+	}
+
+	select {
+	case <-e.Server.ReadyNotify():
+		t.Log("Embedded etcd server is ready!")
+	case <-time.After(5 * time.Second):
+		e.Server.Stop() // サーバーを停止
+		t.Fatal("Embedded etcd server took too long to start")
+	}
+	return e
 }
 
 func testNewClient(t *testing.T) *clientv3.Client {
